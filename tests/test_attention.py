@@ -1,7 +1,9 @@
 """
 tests/test_attention.py
 ========================
-Unit tests for ``model.transformer.attention.ScaledDotProductAttention``.
+Unit tests for:
+  - ``model.transformer.attention.ScaledDotProductAttention``
+  - ``model.transformer.attention.MultiHeadAttention``
 
 All tests run on CPU (no CUDA required).
 
@@ -48,7 +50,7 @@ import math
 import pytest
 import torch
 
-from model.transformer.attention import ScaledDotProductAttention
+from model.transformer.attention import MultiHeadAttention, ScaledDotProductAttention
 
 # ---------------------------------------------------------------------------
 # Constants used across tests — all are constructor arguments, not hardcoded
@@ -480,3 +482,354 @@ class TestDimensionMismatch:
         v = torch.randn(2, 7, 32)  # seq_k differs from K's seq_k
         with pytest.raises(ValueError, match="seq_k"):
             attn(q, k, v)
+
+
+# ===========================================================================
+# MultiHeadAttention tests
+# ===========================================================================
+
+# Small fixed dimensions used across MHA tests (all configurable, nothing
+# specific to AttenSum's final hyperparameters).
+MHA_D_MODEL = 64
+MHA_HEADS = 4
+MHA_HEAD_DIM = MHA_D_MODEL // MHA_HEADS   # 16
+MHA_SEQ_Q = 10
+MHA_SEQ_K = 12
+MHA_BATCH = 3
+
+
+def _make_mha_inputs(
+    b: int = MHA_BATCH,
+    seq_q: int = MHA_SEQ_Q,
+    seq_k: int = MHA_SEQ_K,
+    d_model: int = MHA_D_MODEL,
+    requires_grad: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return random (query, key, value) tensors with d_model last dim."""
+    q = torch.randn(b, seq_q, d_model, requires_grad=requires_grad)
+    k = torch.randn(b, seq_k, d_model, requires_grad=requires_grad)
+    v = torch.randn(b, seq_k, d_model, requires_grad=requires_grad)
+    return q, k, v
+
+
+class TestMHAOutputShapes:
+    """Verify MultiHeadAttention returns the correct tensor shapes."""
+
+    def test_output_shape(self) -> None:
+        """Context output must be (B, seq_q, d_model)."""
+        mha = MultiHeadAttention(d_model=MHA_D_MODEL, num_heads=MHA_HEADS, dropout=0.0)
+        q, k, v = _make_mha_inputs()
+        output, _ = mha(q, k, v)
+        assert output.shape == (MHA_BATCH, MHA_SEQ_Q, MHA_D_MODEL)
+
+    def test_attention_weight_shape(self) -> None:
+        """Attention weights must be (B, num_heads, seq_q, seq_k)."""
+        mha = MultiHeadAttention(d_model=MHA_D_MODEL, num_heads=MHA_HEADS, dropout=0.0)
+        q, k, v = _make_mha_inputs()
+        _, weights = mha(q, k, v)
+        assert weights.shape == (MHA_BATCH, MHA_HEADS, MHA_SEQ_Q, MHA_SEQ_K)
+
+    def test_output_dtype_is_float32(self) -> None:
+        """Both output tensors must be float32."""
+        mha = MultiHeadAttention(d_model=MHA_D_MODEL, num_heads=MHA_HEADS, dropout=0.0)
+        q, k, v = _make_mha_inputs()
+        output, weights = mha(q, k, v)
+        assert output.dtype == torch.float32
+        assert weights.dtype == torch.float32
+
+    def test_multiple_batch_sizes(self) -> None:
+        """Module must handle batch sizes 1, 4, and 16 without shape errors."""
+        mha = MultiHeadAttention(d_model=MHA_D_MODEL, num_heads=MHA_HEADS, dropout=0.0)
+        for b in [1, 4, 16]:
+            q, k, v = _make_mha_inputs(b=b)
+            output, weights = mha(q, k, v)
+            assert output.shape == (b, MHA_SEQ_Q, MHA_D_MODEL)
+            assert weights.shape == (b, MHA_HEADS, MHA_SEQ_Q, MHA_SEQ_K)
+
+    def test_multiple_head_counts(self) -> None:
+        """Module must work for different valid head counts.
+
+        Tests 1, 2, 4, and 8 heads with d_model=64 (all evenly divide 64).
+        """
+        d_model = 64
+        for h in [1, 2, 4, 8]:
+            mha = MultiHeadAttention(d_model=d_model, num_heads=h, dropout=0.0)
+            q, k, v = _make_mha_inputs(d_model=d_model)
+            output, weights = mha(q, k, v)
+            assert output.shape == (MHA_BATCH, MHA_SEQ_Q, d_model)
+            assert weights.shape == (MHA_BATCH, h, MHA_SEQ_Q, MHA_SEQ_K)
+
+    def test_single_head_matches_expected_shape(self) -> None:
+        """With num_heads=1, weight shape must be (B, 1, seq_q, seq_k)."""
+        mha = MultiHeadAttention(d_model=32, num_heads=1, dropout=0.0)
+        q, k, v = _make_mha_inputs(d_model=32)
+        _, weights = mha(q, k, v)
+        assert weights.shape == (MHA_BATCH, 1, MHA_SEQ_Q, MHA_SEQ_K)
+
+
+class TestMHASelfAttention:
+    """Self-attention: query, key, and value are all the same tensor."""
+
+    def test_self_attention_output_shape(self) -> None:
+        """Self-attention output must be (B, seq, d_model)."""
+        d_model, seq = 64, 15
+        mha = MultiHeadAttention(d_model=d_model, num_heads=4, dropout=0.0)
+        x = torch.randn(MHA_BATCH, seq, d_model)
+        output, weights = mha(x, x, x)
+        assert output.shape == (MHA_BATCH, seq, d_model)
+        assert weights.shape == (MHA_BATCH, 4, seq, seq)
+
+    def test_self_attention_weight_shape_square(self) -> None:
+        """For self-attention, weight matrix must be square (seq, seq)."""
+        seq = 8
+        mha = MultiHeadAttention(d_model=MHA_D_MODEL, num_heads=MHA_HEADS, dropout=0.0)
+        x = torch.randn(2, seq, MHA_D_MODEL)
+        _, weights = mha(x, x, x)
+        assert weights.shape[-2] == weights.shape[-1] == seq
+
+
+class TestMHACrossAttention:
+    """Cross-attention: query from one source, key/value from another.
+
+    Simulates the decoder attending to encoder output where query length
+    (decoder) differs from key/value length (encoder).
+    """
+
+    def test_cross_attention_output_shape(self) -> None:
+        """Output shape must be (B, seq_q, d_model) even when seq_q ≠ seq_k."""
+        d_model, seq_q, seq_k = 64, 7, 20
+        mha = MultiHeadAttention(d_model=d_model, num_heads=4, dropout=0.0)
+        q = torch.randn(MHA_BATCH, seq_q, d_model)
+        k = torch.randn(MHA_BATCH, seq_k, d_model)
+        v = torch.randn(MHA_BATCH, seq_k, d_model)
+        output, weights = mha(q, k, v)
+        assert output.shape == (MHA_BATCH, seq_q, d_model)
+        assert weights.shape == (MHA_BATCH, 4, seq_q, seq_k)
+
+    def test_cross_attention_weight_rows_sum_to_one(self) -> None:
+        """Each query position's attention weights over all key positions must sum to 1."""
+        d_model, seq_q, seq_k = 64, 5, 15
+        mha = MultiHeadAttention(d_model=d_model, num_heads=4, dropout=0.0)
+        q = torch.randn(2, seq_q, d_model)
+        k = torch.randn(2, seq_k, d_model)
+        v = torch.randn(2, seq_k, d_model)
+        _, weights = mha(q, k, v)
+        # weights: (B, H, seq_q, seq_k) — last dim must sum to 1
+        row_sums = weights.sum(dim=-1)  # (B, H, seq_q)
+        assert torch.allclose(row_sums, torch.ones_like(row_sums), atol=1e-5)
+
+
+class TestMHAWeightProperties:
+    """Attention weight distribution properties for MultiHeadAttention."""
+
+    def test_weights_sum_to_one_all_heads(self) -> None:
+        """Every head's weights must form a valid probability distribution."""
+        mha = MultiHeadAttention(d_model=MHA_D_MODEL, num_heads=MHA_HEADS, dropout=0.0)
+        q, k, v = _make_mha_inputs()
+        _, weights = mha(q, k, v)
+        # weights: (B, H, seq_q, seq_k)
+        row_sums = weights.sum(dim=-1)  # (B, H, seq_q)
+        assert torch.allclose(
+            row_sums, torch.ones_like(row_sums), atol=1e-5
+        ), f"Weights must sum to 1; min={row_sums.min():.6f}, max={row_sums.max():.6f}"
+
+    def test_weights_non_negative(self) -> None:
+        """All per-head attention weights must be ≥ 0."""
+        mha = MultiHeadAttention(d_model=MHA_D_MODEL, num_heads=MHA_HEADS, dropout=0.0)
+        q, k, v = _make_mha_inputs()
+        _, weights = mha(q, k, v)
+        assert (weights >= 0).all()
+
+    def test_weights_are_finite(self) -> None:
+        """All attention weights must be finite (no NaN or Inf)."""
+        mha = MultiHeadAttention(d_model=MHA_D_MODEL, num_heads=MHA_HEADS, dropout=0.0)
+        q, k, v = _make_mha_inputs()
+        _, weights = mha(q, k, v)
+        assert torch.isfinite(weights).all()
+
+    def test_output_is_finite(self) -> None:
+        """Context output must be finite for typical random inputs."""
+        mha = MultiHeadAttention(d_model=MHA_D_MODEL, num_heads=MHA_HEADS, dropout=0.0)
+        q, k, v = _make_mha_inputs()
+        output, _ = mha(q, k, v)
+        assert torch.isfinite(output).all()
+
+
+class TestMHAMaskBehaviour:
+    """Verify that masks are correctly propagated through all heads."""
+
+    def test_3d_bool_mask_zeroes_masked_positions(self) -> None:
+        """A (B, seq_q, seq_k) bool mask must zero out masked positions in every head."""
+        d_model, heads, seq_q, seq_k = 32, 2, 6, 8
+        mha = MultiHeadAttention(d_model=d_model, num_heads=heads, dropout=0.0)
+        q, k, v = _make_mha_inputs(b=1, seq_q=seq_q, seq_k=seq_k, d_model=d_model)
+
+        # Mask the last 3 key positions for all query positions
+        mask = torch.zeros(1, seq_q, seq_k, dtype=torch.bool)
+        mask[:, :, 5:] = True
+
+        _, weights = mha(q, k, v, mask=mask)
+        # weights: (1, heads, seq_q, seq_k)
+        assert torch.allclose(
+            weights[:, :, :, 5:], torch.zeros(1, heads, seq_q, 3), atol=1e-6
+        ), "Masked key positions must have ~0 weight in every head."
+
+    def test_3d_mask_unmasked_sums_to_one(self) -> None:
+        """Unmasked key positions must still form a valid distribution per head."""
+        d_model, heads, seq_q, seq_k = 32, 2, 4, 8
+        mha = MultiHeadAttention(d_model=d_model, num_heads=heads, dropout=0.0)
+        q, k, v = _make_mha_inputs(b=2, seq_q=seq_q, seq_k=seq_k, d_model=d_model)
+
+        mask = torch.zeros(2, seq_q, seq_k, dtype=torch.bool)
+        mask[:, :, 6:] = True  # mask last 2 of 8 key positions
+
+        _, weights = mha(q, k, v, mask=mask)
+        unmasked_sum = weights[:, :, :, :6].sum(dim=-1)  # (B, H, seq_q)
+        assert torch.allclose(unmasked_sum, torch.ones_like(unmasked_sum), atol=1e-5)
+
+    def test_causal_mask_upper_triangle_all_heads(self) -> None:
+        """Causal (upper-triangular) mask must zero future positions in every head."""
+        seq = 8
+        d_model, heads = 32, 4
+        mha = MultiHeadAttention(d_model=d_model, num_heads=heads, dropout=0.0)
+        x = torch.randn(1, seq, d_model)
+
+        causal_mask = torch.triu(
+            torch.ones(1, seq, seq, dtype=torch.bool), diagonal=1
+        )  # (1, seq, seq)
+
+        _, weights = mha(x, x, x, mask=causal_mask)
+        # weights: (1, H, seq, seq) — upper triangle (excluding diagonal) must be ~0
+        for h in range(heads):
+            upper = weights[0, h].triu(diagonal=1)
+            assert torch.allclose(upper, torch.zeros_like(upper), atol=1e-6), (
+                f"Head {h}: causal mask must zero out above-diagonal weights."
+            )
+
+    def test_2d_mask_broadcasts_over_batch_and_heads(self) -> None:
+        """A (seq_q, seq_k) mask must be broadcast over all batch items and heads."""
+        seq_q, seq_k, d_model, heads = 5, 7, 32, 4
+        mha = MultiHeadAttention(d_model=d_model, num_heads=heads, dropout=0.0)
+        q, k, v = _make_mha_inputs(b=2, seq_q=seq_q, seq_k=seq_k, d_model=d_model)
+
+        # 2-D mask: mask the last key position for every query
+        mask = torch.zeros(seq_q, seq_k, dtype=torch.bool)
+        mask[:, -1] = True
+
+        _, weights = mha(q, k, v, mask=mask)
+        # Last key column must be ~0 for all batches and heads
+        assert torch.allclose(
+            weights[:, :, :, -1], torch.zeros(2, heads, seq_q), atol=1e-6
+        )
+
+    def test_4d_per_head_mask(self) -> None:
+        """A (B, H, seq_q, seq_k) mask allows different masks per head."""
+        b, seq_q, seq_k, d_model, heads = 1, 4, 6, 32, 2
+        mha = MultiHeadAttention(d_model=d_model, num_heads=heads, dropout=0.0)
+        q, k, v = _make_mha_inputs(b=b, seq_q=seq_q, seq_k=seq_k, d_model=d_model)
+
+        # Head 0: no masking.  Head 1: mask the last key position.
+        mask = torch.zeros(b, heads, seq_q, seq_k, dtype=torch.bool)
+        mask[:, 1, :, -1] = True  # only head 1, last key position
+
+        _, weights = mha(q, k, v, mask=mask)
+        # Head 1's last column must be ~0
+        assert torch.allclose(
+            weights[:, 1, :, -1], torch.zeros(b, seq_q), atol=1e-6
+        ), "Per-head mask: head 1 last position must be ~0."
+        # Head 0's last column must be > 0 (no masking)
+        assert (weights[:, 0, :, -1] > 0).all(), (
+            "Per-head mask: head 0 last position must be > 0 (unmasked)."
+        )
+
+
+class TestMHAGradientFlow:
+    """Gradients must propagate through projections back to the raw inputs."""
+
+    def test_grad_flows_to_query(self) -> None:
+        mha = MultiHeadAttention(d_model=MHA_D_MODEL, num_heads=MHA_HEADS, dropout=0.0)
+        q, k, v = _make_mha_inputs(requires_grad=True)
+        output, _ = mha(q, k, v)
+        output.sum().backward()
+        assert q.grad is not None and not torch.all(q.grad == 0)
+
+    def test_grad_flows_to_key(self) -> None:
+        mha = MultiHeadAttention(d_model=MHA_D_MODEL, num_heads=MHA_HEADS, dropout=0.0)
+        q, k, v = _make_mha_inputs(requires_grad=True)
+        output, _ = mha(q, k, v)
+        output.sum().backward()
+        assert k.grad is not None and not torch.all(k.grad == 0)
+
+    def test_grad_flows_to_value(self) -> None:
+        mha = MultiHeadAttention(d_model=MHA_D_MODEL, num_heads=MHA_HEADS, dropout=0.0)
+        q, k, v = _make_mha_inputs(requires_grad=True)
+        output, _ = mha(q, k, v)
+        output.sum().backward()
+        assert v.grad is not None and not torch.all(v.grad == 0)
+
+    def test_grad_flows_to_projection_weights(self) -> None:
+        """All four projection matrices (W_Q, W_K, W_V, W_O) must receive gradients."""
+        mha = MultiHeadAttention(d_model=MHA_D_MODEL, num_heads=MHA_HEADS, dropout=0.0)
+        q, k, v = _make_mha_inputs()
+        output, _ = mha(q, k, v)
+        output.sum().backward()
+        for name, param in mha.named_parameters():
+            assert param.grad is not None, f"No gradient for parameter '{name}'."
+            assert not torch.all(param.grad == 0), (
+                f"Parameter '{name}' has all-zero gradients."
+            )
+
+    def test_grad_flows_with_mask(self) -> None:
+        """Gradients must reach Q, K, V when a bool mask is applied."""
+        d_model, heads, seq_q, seq_k = 32, 2, 5, 7
+        mha = MultiHeadAttention(d_model=d_model, num_heads=heads, dropout=0.0)
+        q, k, v = _make_mha_inputs(
+            b=1, seq_q=seq_q, seq_k=seq_k, d_model=d_model, requires_grad=True
+        )
+        mask = torch.zeros(1, seq_q, seq_k, dtype=torch.bool)
+        mask[:, :, -1] = True
+        output, _ = mha(q, k, v, mask=mask)
+        output.sum().backward()
+        assert q.grad is not None and not torch.all(q.grad == 0)
+        assert k.grad is not None and not torch.all(k.grad == 0)
+        assert v.grad is not None and not torch.all(v.grad == 0)
+
+
+class TestMHACPU:
+    """Confirm all tensors stay on CPU throughout the MHA pipeline."""
+
+    def test_output_on_cpu(self) -> None:
+        mha = MultiHeadAttention(d_model=MHA_D_MODEL, num_heads=MHA_HEADS, dropout=0.0)
+        q, k, v = _make_mha_inputs()
+        output, weights = mha(q, k, v)
+        assert output.device.type == "cpu"
+        assert weights.device.type == "cpu"
+
+
+class TestMHAConstructorValidation:
+    """Invalid constructor arguments must raise descriptive ValueError."""
+
+    def test_d_model_not_divisible_by_num_heads_raises(self) -> None:
+        """d_model=65, num_heads=4 — 65 % 4 ≠ 0 — must raise ValueError."""
+        with pytest.raises(ValueError, match="divisible"):
+            MultiHeadAttention(d_model=65, num_heads=4)
+
+    def test_num_heads_zero_raises(self) -> None:
+        with pytest.raises(ValueError, match="num_heads"):
+            MultiHeadAttention(d_model=64, num_heads=0)
+
+    def test_d_model_zero_raises(self) -> None:
+        with pytest.raises(ValueError, match="d_model"):
+            MultiHeadAttention(d_model=0, num_heads=4)
+
+    def test_dropout_out_of_range_raises(self) -> None:
+        with pytest.raises(ValueError, match="dropout"):
+            MultiHeadAttention(d_model=64, num_heads=4, dropout=1.0)
+
+    def test_invalid_mask_dims_raises(self) -> None:
+        """A 1-D mask (unsupported) must raise ValueError."""
+        mha = MultiHeadAttention(d_model=32, num_heads=2)
+        q, k, v = _make_mha_inputs(b=1, seq_q=4, seq_k=4, d_model=32)
+        bad_mask = torch.zeros(4, dtype=torch.bool)  # 1-D — not supported
+        with pytest.raises(ValueError, match="mask"):
+            mha(q, k, v, mask=bad_mask)
