@@ -3,7 +3,7 @@ model/transformer/__init__.py
 ==============================
 Public API for the ``model.transformer`` package.
 
-Higher-level modules (Encoder stack, Decoder, full Transformer) can
+Higher-level modules (Encoder stack, Decoder stack, full Transformer) can
 import any component directly from this package::
 
     from model.transformer import TokenEmbedding, PositionalEncoding
@@ -12,9 +12,11 @@ import any component directly from this package::
     from model.transformer import PositionwiseFeedForward
     from model.transformer import LayerNorm, ResidualConnection
     from model.transformer import EncoderBlock
+    from model.transformer import DecoderBlock
 """
 
 from model.transformer.attention import MultiHeadAttention, ScaledDotProductAttention
+from model.transformer.decoder import DecoderBlock
 from model.transformer.embeddings import PositionalEncoding, TokenEmbedding
 from model.transformer.encoder import EncoderBlock
 from model.transformer.feed_forward import PositionwiseFeedForward
@@ -29,5 +31,7 @@ __all__ = [
     "LayerNorm",
     "ResidualConnection",
     "EncoderBlock",
+    "DecoderBlock",
 ]
+
 
